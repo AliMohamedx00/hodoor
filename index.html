@@ -162,6 +162,13 @@ async function onUser(u) {
     snap = await getDoc(ref);
   }
   S.me = { id: u.uid, ...snap.data() };
+  // مدير النظام (الإيميل الموجود في قواعد الأمان) يفعّل نفسه تلقائياً
+  if (!S.me.active || S.me.role !== "admin") {
+    try {
+      await updateDoc(ref, { active: true, role: "admin" });
+      S.me.active = true; S.me.role = "admin";
+    } catch (e) { /* مش مدير نظام — عادي */ }
+  }
   if (!S.me.active) { S.screen = "pending"; return render(); }
   await loadCommon();
   S.screen = isMgr() ? "mdash" : "home";
