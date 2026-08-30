@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>كود الحضور — شاشة الاستقبال</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600&family=IBM+Plex+Mono:wght@500&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{background:#0B1522;color:#fff;font-family:"IBM Plex Sans Arabic",system-ui,sans-serif;display:flex;align-items:center;justify-content:center;padding:5vh 4vw}
+.wrap{text-align:center;max-width:900px;width:100%}
+.kick{font-family:"IBM Plex Mono",monospace;font-size:clamp(11px,1.4vw,15px);letter-spacing:.18em;text-transform:uppercase;color:rgba(255,255,255,.45)}
+h1{margin:14px 0 0;font-size:clamp(20px,3vw,34px);font-weight:600}
+.branch{margin-top:10px;font-size:clamp(13px,1.6vw,18px);color:rgba(255,255,255,.55)}
+.code{margin:clamp(26px,5vh,56px) 0 0;font-family:"IBM Plex Mono",monospace;font-weight:500;font-size:clamp(64px,17vw,190px);line-height:1;letter-spacing:.06em}
+.bar{margin:clamp(20px,4vh,40px) auto 0;max-width:520px;height:8px;border-radius:8px;background:rgba(255,255,255,.12);overflow:hidden}
+.bar i{display:block;height:8px;border-radius:8px;background:#4C9AE8;transition:width 1s linear}
+.sec{margin-top:14px;font-family:"IBM Plex Mono",monospace;font-size:clamp(13px,1.6vw,18px);color:rgba(255,255,255,.45)}
+.note{margin-top:clamp(24px,5vh,48px);font-size:clamp(12px,1.5vw,16px);line-height:1.8;color:rgba(255,255,255,.4)}
+select,button{font-family:inherit;padding:12px 14px;border-radius:11px;border:1px solid rgba(255,255,255,.2);background:rgba(255,255,255,.07);color:#fff;font-size:14px}
+.err{margin-top:20px;padding:14px;border-radius:12px;background:rgba(192,57,43,.2);font-size:14px;line-height:1.7}
+</style>
+</head>
+<body>
+<div class="wrap" id="w"><div class="kick">جاري التحميل…</div></div>
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getFirestore, doc, setDoc, collection, getDocs, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+import { getAuth, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+
+const w = document.getElementById("w");
+let cfg = null;
+try { cfg = JSON.parse(localStorage.getItem("waqti.cfg") || "null"); } catch (e) {}
+if (!cfg || !cfg.apiKey) cfg = {
+  apiKey: "AIzaSyD1BIciu8R6_o-0xmWCd4xEDKb1QrhHhtY",
+  authDomain: "professional-print-bd10c.firebaseapp.com",
+  projectId: "professional-print-bd10c",
+  storageBucket: "professional-print-bd10c.firebasestorage.app",
+  messagingSenderId: "386401773561",
+  appId: "1:386401773561:web:7ccf72810c25bf8e63ff28"
+};
+if (!cfg) {
+  w.innerHTML = `<h1>محتاج تفتح التطبيق الأول</h1>
+    <div class="note">افتح <a href="index.html" style="color:#4C9AE8">التطبيق</a> على نفس الجهاز وسجّل دخول مرة واحدة، وبعدها ارجع هنا.</div>`;
+} else {
+  const app = initializeApp(cfg), db = getFirestore(app), auth = getAuth(app);
+  const CS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const gen = () => {
+    let a = "", b = "";
+    for (let i = 0; i < 4; i++) a += CS[Math.floor(Math.random() * CS.length)];
+    for (let i = 0; i < 2; i++) b += CS[Math.floor(Math.random() * CS.length)];
+    return a + "-" + b;
+  };
+  let branches = [], branchId = localStorage.getItem("waqti.kiosk.branch") || "";
+  let code = gen(), left = 30, ok = true, errMsg = "";
+
+  onAuthStateChanged(auth, async u => {
+    if (!u) {
+      w.innerHTML = `<h1>محتاج تسجيل دخول</h1>
+        <div class="note">سجّل دخول من <a href="index.html" style="color:#4C9AE8">التطبيق</a> على الجهاز ده بحساب مدير، وبعدها ارجع هنا.</div>`;
+      return;
+    }
+    try {
+      const b = await getDocs(collection(db, "branches"));
+      branches = b.docs.map(d => ({ id: d.id, ...d.data() }));
+      if (!branchId && branches[0]) branchId = branches[0].id;
+      draw(); await push(); tick();
+    } catch (e) {
+      ok = false; errMsg = e.message; draw();
+    }
+  });
+
+  async function push() {
+    if (!branchId) return;
+    try {
+      await setDoc(doc(db, "branches", branchId, "live", "code"), { code, updatedAt: serverTimestamp() });
+      ok = true;
+    } catch (e) { ok = false; errMsg = e.message; }
+    draw();
+  }
+  function tick() {
+    setInterval(async () => {
+      left--;
+      if (left <= 0) { left = 30; code = gen(); await push(); }
+      draw();
+    }, 1000);
+  }
+  function draw() {
+    const br = branches.find(x => x.id === branchId);
+    w.innerHTML = `
+      <div class="kick">كود الحضور · وقتي</div>
+      <h1>اكتب الكود ده في التطبيق</h1>
+      <div class="branch">${br ? br.name : "اختار الفرع"}</div>
+      <div class="code">${code}</div>
+      <div class="bar"><i style="width:${Math.round(left / 30 * 100)}%"></i></div>
+      <div class="sec">يتغير بعد ${left} ثانية</div>
+      ${branches.length > 1 ? `<div style="margin-top:26px"><select id="sel">
+        ${branches.map(b => `<option value="${b.id}" ${b.id === branchId ? "selected" : ""}>${b.name}</option>`).join("")}
+      </select></div>` : ""}
+      ${ok ? `<div class="note">سيب الشاشة دي مفتوحة طول اليوم. الكود بيتغير كل ٣٠ ثانية، فتصويره مش بينفع.</div>`
+           : `<div class="err">مش قادر أكتب الكود: ${errMsg}<br>تأكد إن الحساب اللي داخل بيه مدير، وإن قواعد الأمان مركبة.</div>`}
+    `;
+    const sel = document.getElementById("sel");
+    if (sel) sel.onchange = async e => {
+      branchId = e.target.value;
+      localStorage.setItem("waqti.kiosk.branch", branchId);
+      code = gen(); left = 30; await push();
+    };
+  }
+}
+</script>
+</body>
+</html>

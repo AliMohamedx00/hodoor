@@ -1,0 +1,141 @@
+rules_version = '2';
+
+// ══════════════════════════════════════════════════════════════
+//  وقتي — قواعد أمان Firestore
+//  انسخ الملف ده بالكامل والزقه في:
+//  Firebase Console ← Firestore Database ← Rules ← Publish
+//
+//  ⚠ خطوة واحدة إلزامية قبل النشر:
+//  حطّ إيميلك في السطر اللي تحته بدل الموجود.
+//  ده الإيميل اللي هيبقى «مدير النظام» الأول.
+// ══════════════════════════════════════════════════════════════
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ↓↓↓ عدّل الإيميل هنا ↓↓↓
+    function adminEmails() {
+      return ['sa.hm199737@gmail.com'];
+    }
+
+    function signedIn()   { return request.auth != null; }
+    function me()         { return request.auth.uid; }
+    function myEmail()    { return request.auth.token.email; }
+    function bootAdmin()  { return signedIn() && myEmail() in adminEmails(); }
+
+    function meDoc() {
+      return get(/databases/$(database)/documents/employees/$(me())).data;
+    }
+    function myRole()   { return bootAdmin() ? 'admin' : meDoc().role; }
+    function isAdmin()  { return bootAdmin() || myRole() == 'admin'; }
+    function isMgr()    { return isAdmin() || myRole() == 'manager'; }
+    function amActive() { return bootAdmin() || meDoc().active == true; }
+
+    // ── الموظفين ────────────────────────────────────────────────
+    match /employees/{uid} {
+      allow read: if signedIn() && (uid == me() || isMgr());
+
+      // الموظف يعمل ملفه بنفسه أول مرة — موقوف لحد ما المدير يفعّله
+      allow create: if signedIn() && uid == me()
+        && request.resource.data.uid == me()
+        && request.resource.data.role == 'employee'
+        && request.resource.data.active == false;
+
+      // مدير النظام بس هو اللي يفعّل ويحدد الفرع والوردية والدور
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    // ── الفروع ──────────────────────────────────────────────────
+    match /branches/{branchId} {
+      allow read:  if signedIn();
+      allow write: if isAdmin();
+
+      // كود الاستقبال: المدير بيكتبه من شاشة الاستقبال، والكل بيقرأه للتحقق
+      match /live/{docId} {
+        allow read:  if signedIn();
+        allow write: if isMgr();
+      }
+    }
+
+    // ── الورديات ────────────────────────────────────────────────
+    match /shifts/{shiftId} {
+      allow read:  if signedIn();
+      allow write: if isAdmin();
+    }
+
+    // ── الحضور ──────────────────────────────────────────────────
+    match /attendance/{docId} {
+
+      function mine()     { return resource.data.uid == me(); }
+      function newMine()  { return request.resource.data.uid == me(); }
+      function d()        { return request.resource.data; }
+      function branch()   { return get(/databases/$(database)/documents/branches/$(d().branchId)).data; }
+      function liveCode() { return get(/databases/$(database)/documents/branches/$(d().branchId)/live/code).data.code; }
+
+      // الموقع لازم يكون جوه صندوق الفرع — الحساب هنا على السيرفر
+      function insideBox(c) {
+        return c != null
+          && math.abs(c.latitude  - branch().lat) <= branch().latDelta
+          && math.abs(c.longitude - branch().lng) <= branch().lngDelta;
+      }
+      function validIn() {
+        return d().checkInAt == request.time              // الوقت من السيرفر إجبارياً
+          && d().checkInMethod in ['gps', 'qr']
+          && (
+            (d().checkInMethod == 'gps' && insideBox(d().checkInCoords))
+            || (d().checkInMethod == 'qr' && d().checkInCode == liveCode())
+          );
+      }
+      function validOut() {
+        return d().checkOutAt == request.time
+          && d().checkOutMethod in ['gps', 'qr']
+          && (
+            (d().checkOutMethod == 'gps' && insideBox(d().checkOutCoords))
+            || (d().checkOutMethod == 'qr' && d().checkOutCode == liveCode())
+          );
+      }
+
+      allow read: if signedIn() && (mine() || isMgr());
+
+      // أول تسجيل في اليوم: معرّف المستند = uid_تاريخ، فمينفعش تكرار
+      allow create: if signedIn() && amActive() && newMine()
+        && docId == me() + '_' + d().date
+        && validIn();
+
+      // الانصراف: تحديث واحد فقط، وما يلمسش وقت الحضور
+      allow update: if signedIn() && amActive() && mine()
+        && ('checkInAt' in resource.data)
+        && !('checkOutAt' in resource.data)
+        && d().checkInAt == resource.data.checkInAt
+        && validOut();
+
+      allow delete: if false;   // السجل ما يتمسحش — التصحيح بطلب معتمد
+    }
+
+    // ── الطلبات (إجازات وأذونات) ────────────────────────────────
+    match /requests/{reqId} {
+      allow read: if signedIn() && (resource.data.uid == me() || isMgr());
+
+      allow create: if signedIn() && amActive()
+        && request.resource.data.uid == me()
+        && request.resource.data.status == 'pending'
+        && request.resource.data.createdAt == request.time;
+
+      // المدير بيغيّر الحالة فقط — وممنوع يوافق على طلبه الشخصي
+      allow update: if isMgr()
+        && resource.data.uid != me()
+        && resource.data.status == 'pending'
+        && request.resource.data.status in ['approved', 'rejected']
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['status', 'decidedBy', 'decidedAt']);
+
+      allow delete: if false;
+    }
+
+    // أي حاجة تانية: مرفوضة
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
