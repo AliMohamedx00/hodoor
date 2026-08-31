@@ -84,7 +84,7 @@ import {
   createUserWithEmailAndPassword, signOut
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 import {
-  getFirestore, doc, getDoc, setDoc, updateDoc, collection, query, where,
+  getFirestore, doc, getDoc, setDoc, updateDoc, deleteDoc, collection, query, where,
   orderBy, getDocs, addDoc, serverTimestamp, onSnapshot, enableIndexedDbPersistence,
   Timestamp
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
@@ -111,7 +111,7 @@ const app = document.getElementById("app");
 const S = {
   screen: "boot", user: null, me: null, branches: [], shifts: [],
   today: null, month: [], monthOffset: 0, requests: [], teamToday: [],
-  pending: [], people: [], busy: false, overlay: null, toast: null,
+  pending: [], people: [], myTeamIds: [], decided: [], busy: false, overlay: null, toast: null,
   qrInput: "", form: {}, online: navigator.onLine
 };
 
@@ -143,6 +143,24 @@ const isAdmin = () => S.me && S.me.role === "admin";
 function myShift() { return S.shifts.find(x => x.id === (S.me && S.me.shiftId)) || { startMinute: 540, endMinute: 1020, graceMinutes: 5, workdays: [0, 1, 2, 3, 4], name: "الوردية" }; }
 function shiftFor(p) {
   return S.shifts.find(x => x.id === (p && p.shiftId)) || { startMinute: 540, endMinute: 1020, graceMinutes: 5, name: "الوردية" };
+}
+// كل اللي تحتي في الشجرة — مباشر وغير مباشر
+function subtreeIds(rootUid, all) {
+  const kids = {};
+  all.forEach(p => {
+    const m = p.managerUid || "";
+    if (!kids[m]) kids[m] = [];
+    kids[m].push(p.id);
+  });
+  const out = [], stack = (kids[rootUid] || []).slice();
+  const seen = {};
+  while (stack.length) {
+    const id = stack.pop();
+    if (seen[id]) continue;
+    seen[id] = 1; out.push(id);
+    (kids[id] || []).forEach(k => stack.push(k));
+  }
+  return out;
 }
 function myBranch() { return S.branches.find(x => x.id === (S.me && S.me.branchId)) || null; }
 
@@ -208,8 +226,22 @@ async function loadRequests() {
   S.requests = mine.docs.map(d => ({ id: d.id, ...d.data() }))
     .sort((a, b) => (toDate(b.createdAt) || 0) - (toDate(a.createdAt) || 0));
   if (isMgr()) {
+    if (!S.people.length) {
+      const emp = await getDocs(collection(fb.db, "employees"));
+      S.people = emp.docs.map(d => ({ id: d.id, ...d.data() }));
+    }
+    S.myTeamIds = isAdmin() ? S.people.map(p => p.id) : subtreeIds(S.user.uid, S.people);
     const p = await getDocs(query(collection(fb.db, "requests"), where("status", "==", "pending")));
-    S.pending = p.docs.map(d => ({ id: d.id, ...d.data() })).filter(r => r.uid !== S.user.uid);
+    S.pending = p.docs.map(d => ({ id: d.id, ...d.data() }))
+      .filter(r => r.uid !== S.user.uid && S.myTeamIds.indexOf(r.uid) !== -1);
+    // مدير النطام: قرارات المديرين الأخيرة — يقدر يعدلها
+    if (isAdmin()) {
+      const all = await getDocs(collection(fb.db, "requests"));
+      S.decided = all.docs.map(d => ({ id: d.id, ...d.data() }))
+        .filter(r => r.status !== "pending" && r.uid !== S.user.uid)
+        .sort((a, b) => (toDate(b.decidedAt) || 0) - (toDate(a.decidedAt) || 0))
+        .slice(0, 20);
+    }
   }
 }
 async function loadTeamToday() {
@@ -221,7 +253,10 @@ async function loadTeamToday() {
   const byUid = {};
   att.docs.forEach(d => { byUid[d.data().uid] = d.data(); });
   S.people = emp.docs.map(d => ({ id: d.id, ...d.data() }));      // الكل — بما فيهم الموقوفين
-  S.teamToday = S.people.filter(p => p.active).map(p => ({ p, a: byUid[p.id] || null }));
+  S.myTeamIds = isAdmin() ? S.people.map(p => p.id) : subtreeIds(S.user.uid, S.people);
+  S.teamToday = S.people
+    .filter(p => p.active && (isAdmin() || S.myTeamIds.indexOf(p.id) !== -1))
+    .map(p => ({ p, a: byUid[p.id] || null }));
 }
 
 /* ---------- المنطق ---------- */
@@ -233,7 +268,7 @@ function dayStats(rec, shiftOverride) {
   const late = Math.max(0, inMin - sh.startMinute - (sh.graceMinutes || 0));
   const worked = co ? Math.max(0, Math.round((co - ci) / 60000)) : 0;
   const outMin = co ? co.getHours() * 60 + co.getMinutes() : 0;
-  const ot = co ? Math.max(0, outMin - sh.endMinute - 15) : 0;
+  const ot = co ? Math.max(0, outMin - sh.endMinute - (sh.otAfterMinutes != null ? sh.otAfterMinutes : 15)) : 0;
   return { worked, late, ot, status: late > 0 ? "late" : "ok" };
 }
 function monthSummary() {
@@ -243,7 +278,7 @@ function monthSummary() {
     if (st.status === "none") return;
     days++; if (st.late > 0) late++; mins += st.worked; ot += st.ot;
   });
-  return { days, late, hours: Math.round(mins / 60), ot: hhmm(ot) };
+  return { days, late, hours: Math.round(mins / 60), otMin: ot, ot: hhmm(ot) };
 }
 function inBranchBox(coords, br) {
   if (!br) return false;
@@ -310,6 +345,7 @@ async function submitLeave() {
   if (f.to < f.from) return toast("تاريخ النهاية قبل البداية", true);
   await addDoc(collection(fb.db, "requests"), {
     uid: S.user.uid, name: S.me.name, employeeId: S.me.employeeId || "",
+    managerUid: S.me.managerUid || "", branchId: S.me.branchId || "",
     kind: "leave", type: f.type || "annual", from: f.from, to: f.to,
     reason: f.reason.trim(), status: "pending", createdAt: serverTimestamp()
   });
@@ -317,7 +353,8 @@ async function submitLeave() {
 }
 async function decide(r, ok) {
   await updateDoc(doc(fb.db, "requests", r.id), {
-    status: ok ? "approved" : "rejected", decidedBy: S.user.uid, decidedAt: serverTimestamp()
+    status: ok ? "approved" : "rejected", decidedBy: S.user.uid,
+    decidedByName: S.me.name, decidedAt: serverTimestamp()
   });
   await loadRequests(); render();
 }
@@ -342,14 +379,14 @@ async function exportCsv() {
   emp.docs.forEach(d => { shiftOf[d.id] = shById[d.data().shiftId] || null; });
   const fallback = { startMinute: 540, endMinute: 1020, graceMinutes: 5 };
   const rows = [["الموظف", "الرقم الوظيفي", "التاريخ", "اليوم", "الوردية", "الحضور", "الانصراف", "الساعات", "التأخير (دقيقة)", "إضافي (دقيقة)", "الطريقة", "الحالة"]];
-  r.docs.map(x => x.data()).sort((a, b) => a.date.localeCompare(b.date) || String(a.name).localeCompare(String(b.name))).forEach(a => {
+  // \u0627\u0644\u062a\u0642\u0631\u064a\u0631 \u0641\u0631\u064a\u0642 \u0627\u0644\u0645\u062f\u064a\u0631 \u0628\u0633 \u2014 \u0648\u0645\u062f\u064a\u0631 \u0627\u0644\u0646\u0637\u0627\u0645 \u064a\u0634\u0648\u0641 \u0627\u0644\u0643\u0644\n  const allowed = isAdmin() ? null : S.myTeamIds.concat([S.user.uid]);\n  r.docs.map(x => x.data())\n    .filter(a => !allowed || allowed.indexOf(a.uid) !== -1)\n    .sort((a, b) => a.date.localeCompare(b.date) || String(a.name).localeCompare(String(b.name))).forEach(a => {
     const sh = shiftOf[a.uid] || fallback;
     const ci = toDate(a.checkInAt), co = toDate(a.checkOutAt);
     const inMin = ci ? ci.getHours() * 60 + ci.getMinutes() : 0;
     const late = ci ? Math.max(0, inMin - sh.startMinute - (sh.graceMinutes || 0)) : 0;
     const worked = ci && co ? Math.round((co - ci) / 60000) : 0;
     const outMin = co ? co.getHours() * 60 + co.getMinutes() : 0;
-    const ot = co ? Math.max(0, outMin - sh.endMinute - 15) : 0;
+    const ot = co ? Math.max(0, outMin - sh.endMinute - (sh.otAfterMinutes != null ? sh.otAfterMinutes : 15)) : 0;
     rows.push([a.name || "", a.employeeId || "", a.date, DOW[new Date(a.date).getDay()],
       sh.name || "—", fmtT(ci), fmtT(co), worked ? hhmm(worked) : "", late || "", ot || "",
       a.checkInMethod === "qr" ? "كود" : "موقع", late > 0 ? "متأخر" : ci ? "منتظم" : "غياب"]);
@@ -508,6 +545,7 @@ function vLog() {
         <div><div style="font-size:9.5px;color:#A2AAB4">الحضور</div><div class="mono" style="margin-top:4px;font-size:12.5px">${fmtT(toDate(r.checkInAt))}</div></div>
         <div><div style="font-size:9.5px;color:#A2AAB4">الانصراف</div><div class="mono" style="margin-top:4px;font-size:12.5px">${fmtT(toDate(r.checkOutAt))}</div></div>
         <div><div style="font-size:9.5px;color:#A2AAB4">ساعات</div><div class="mono" style="margin-top:4px;font-size:12.5px">${st.worked ? hhmm(st.worked) : "—"}</div></div>
+        ${st.ot ? `<div><div style="font-size:9.5px;color:#A2AAB4">إضافي</div><div class="mono" style="margin-top:4px;font-size:12.5px;color:#1B6340">${hhmm(st.ot)}</div></div>` : ""}
       </div>
       <span class="pill ${cls}">${lbl}</span>
     </div>`;
@@ -526,6 +564,8 @@ function vLog() {
       <div class="stat"><span>تأخير</span><b style="color:#B4530A">${s.late}</b></div>
       <div class="stat"><span>ساعات</span><b>${s.hours}</b></div>
     </div>
+    ${s.otMin ? `<div class="banner" style="margin-top:9px;background:#EAF3EC;border:1px solid #CBE3D2;color:#1B6340">
+      <span class="dot" style="background:#1E7A4B"></span> ساعات إضافية الشهر ده: ${s.ot}</div>` : ""}
     ${S.month.length ? `<div class="list" style="margin-top:16px">${rows}</div>`
       : `<div style="margin-top:60px;text-align:center"><div class="muted">مفيش تسجيلات في الشهر ده.</div></div>`}
   </div>`;
@@ -602,8 +642,8 @@ function vMDash() {
     </div>`;
   }).join("");
   return `<div class="pad scroll">
-    <div class="h2">لوحة المدير</div>
-    <h1 class="h1" style="margin-top:6px">الفريق النهاردة — ${t.length}</h1>
+    <div class="h2">${isAdmin() ? "لوحة المدير العام" : "لوحة المدير"}</div>
+    <h1 class="h1" style="margin-top:6px">${isAdmin() ? "الشركة النهاردة" : "فريقي النهاردة"} — ${t.length}</h1>
     <div class="grid3" style="margin-top:18px">
       <div class="stat" style="background:#10294A;border-color:#10294A"><span style="color:rgba(255,255,255,.6)">حاضر</span><b style="color:#fff">${present}</b></div>
       <div class="stat"><span>متأخر</span><b style="color:#B4530A">${late}</b></div>
@@ -636,8 +676,28 @@ function vMAppr() {
   return `<div class="pad scroll">
     <h1 class="h1">الموافقات</h1>
     ${S.pending.length ? `<div class="list" style="margin-top:16px">${rows}</div>`
-      : `<div style="margin-top:70px;text-align:center"><div style="font-weight:600;color:#10294A">مفيش طلبات معلقة</div>
+      : `<div style="margin-top:50px;text-align:center"><div style="font-weight:600;color:#10294A">مفيش طلبات معلقة</div>
          <div class="muted" style="margin-top:8px">كل الطلبات اتراجعت.</div></div>`}
+    ${isAdmin() && S.decided.length ? `
+      <div class="h2" style="margin-top:28px">قرارات المديرين — تقدر تعدّلها</div>
+      <p class="muted" style="margin:8px 0 0;font-size:12px">كمدير عام، قرارك بيلغي قرار المدير المباشر.</p>
+      <div class="list" style="margin-top:12px">
+        ${S.decided.map(r => `<div class="card" style="padding:14px">
+          <div class="row" style="justify-content:space-between">
+            <div style="flex:1">
+              <div style="font-weight:600;font-size:13px;color:#10294A">${esc(r.name)}</div>
+              <div style="font-size:11.5px;color:#8A929C;margin-top:4px">${esc(T[r.type] || r.kind)} · ${esc(r.from)} → ${esc(r.to)}</div>
+            </div>
+            <span class="pill ${r.status === "approved" ? "ok" : "bad"}">${r.status === "approved" ? "مقبولة" : "مرفوضة"}</span>
+          </div>
+          <div class="muted" style="margin-top:8px;font-size:11.5px">قرار: ${esc(r.decidedByName || "مدير")}</div>
+          <div class="grid2" style="margin-top:11px">
+            ${r.status === "approved"
+              ? `<button class="btn danger" style="padding:11px;font-size:12px" data-a="override" data-v="${r.id}" data-ok="0">تغيير لرفض</button><div></div>`
+              : `<div></div><button class="btn" style="padding:11px;font-size:12px" data-a="override" data-v="${r.id}" data-ok="1">تغيير لموافقة</button>`}
+          </div>
+        </div>`).join("")}
+      </div>` : ""}
   </div>`;
 }
 function vMRep() {
@@ -691,6 +751,12 @@ function vPeople() {
             ${S.shifts.map(s => `<option value="${s.id}" ${p.shiftId === s.id ? "selected" : ""}>${esc(s.name)}</option>`).join("")}
           </select></div>
       </div>
+      <div style="margin-top:10px"><label class="label">المدير المباشر — اللي هيوافق على طلباته</label>
+        <select class="field" data-p="${p.id}" data-k="managerUid">
+          <option value="">— مفيش مدير —</option>
+          ${S.people.filter(m => m.id !== p.id && m.role !== "employee")
+            .map(m => `<option value="${m.id}" ${p.managerUid === m.id ? "selected" : ""}>${esc(m.name)}${m.role === "admin" ? " (مدير عام)" : ""}</option>`).join("")}
+        </select></div>
       <div class="grid2" style="margin-top:12px">
         <button class="btn ghost" style="padding:12px;font-size:12.5px" data-a="toggleActive" data-v="${p.id}">${p.active ? "إيقاف" : "تفعيل"}</button>
         <button class="btn" style="padding:12px;font-size:12.5px" data-a="savePerson" data-v="${p.id}">حفظ</button>
@@ -698,21 +764,48 @@ function vPeople() {
     </div>`).join("");
   return `<div class="pad scroll">
     <div class="row"><button class="btn ghost" style="width:34px;padding:8px" data-a="goMDash">→</button><h1 class="h1">الموظفين</h1></div>
-    <p class="muted" style="margin:10px 0 0">الموظف يعمل حساب بنفسه من التطبيق، وانت تفعّله وتحدد فرعه ووردياته.</p>
+    <p class="muted" style="margin:10px 0 0">الموظف يعمل حساب بنفسه من التطبيق، وانت تفعّله وتحدد فرعه ووردياته ومديره المباشر.</p>
+    <div class="card" style="margin-top:14px;padding:14px;background:#EFF3F8;border-color:#D6DEE9">
+      <div class="h2" style="color:#31465F">إزاي الأدوار بتشتغل</div>
+      <div style="margin-top:9px;font-size:12px;line-height:1.85;color:#41505F">
+        <strong>موظف</strong> — يسجّل حضوره ويشوف سجله بس.<br>
+        <strong>مدير</strong> — يشوف ويوافق على اللي تحته في الشجرة، مباشر وغير مباشر.<br>
+        <strong>مدير نظام</strong> — يشوف الشركة كلها، ويقدر يعدّل أي قرار مدير.
+      </div>
+    </div>
     <div class="list" style="margin-top:16px">${rows || `<div class="muted">مفيش حسابات لسه.</div>`}</div>
   </div>`;
 }
 function vSetupData() {
   const f = S.form;
+  const eb = f.editBranch, es = f.editShift;
   return `<div class="pad scroll">
     <div class="row"><button class="btn ghost" style="width:34px;padding:8px" data-a="goMore">→</button><h1 class="h1">الفروع والورديات</h1></div>
 
     <div class="h2" style="margin-top:20px">الفروع</div>
     <div class="list" style="margin-top:10px">
-      ${S.branches.map(b => `<div class="line"><div style="flex:1">
-        <div style="font-weight:600;font-size:13px;color:#10294A">${esc(b.name)}</div>
-        <div class="mono" style="font-size:11px;color:#8A929C;margin-top:4px">${b.lat.toFixed(5)}, ${b.lng.toFixed(5)} · ${b.radiusMeters} م</div>
-      </div></div>`).join("") || `<div class="muted">مفيش فروع.</div>`}
+      ${S.branches.map(b => eb === b.id ? `
+        <div class="card" style="padding:15px;border-color:#10294A">
+          <div class="h2">تعديل الفرع</div>
+          <div style="margin-top:11px"><label class="label">الاسم</label><input class="field" id="eb_name" value="${esc(b.name)}"></div>
+          <div class="grid2" style="margin-top:10px">
+            <div><label class="label">نصف القطر (متر)</label><input class="field mono" id="eb_radius" inputmode="numeric" value="${b.radiusMeters}"></div>
+            <div><label class="label">الموقع</label><button class="btn ghost" style="padding:13px;font-size:12.5px" data-a="reHere" data-v="${b.id}">تحديث من موقعي</button></div>
+          </div>
+          <div class="mono" style="margin-top:9px;font-size:11.5px;color:#8A929C">${(f.ebLat != null ? f.ebLat : b.lat).toFixed(5)}, ${(f.ebLng != null ? f.ebLng : b.lng).toFixed(5)}${f.ebLat != null ? " · موقع جديد" : ""}</div>
+          <div class="grid2" style="margin-top:12px">
+            <button class="btn ghost" style="padding:12px;font-size:12.5px" data-a="cancelEdit">إلغاء</button>
+            <button class="btn" style="padding:12px;font-size:12.5px" data-a="saveBranch" data-v="${b.id}">حفظ</button>
+          </div>
+          <button class="btn danger" style="margin-top:9px;padding:12px;font-size:12.5px" data-a="delBranch" data-v="${b.id}">حذف الفرع</button>
+        </div>` : `
+        <div class="line">
+          <div style="flex:1">
+            <div style="font-weight:600;font-size:13px;color:#10294A">${esc(b.name)}</div>
+            <div class="mono" style="font-size:11px;color:#8A929C;margin-top:4px">${b.lat.toFixed(5)}, ${b.lng.toFixed(5)} · ${b.radiusMeters} م</div>
+          </div>
+          <button class="btn ghost" style="width:auto;padding:9px 13px;font-size:12px" data-a="editBranch" data-v="${b.id}">تعديل</button>
+        </div>`).join("") || `<div class="muted">مفيش فروع.</div>`}
     </div>
     <div class="card" style="margin-top:12px;padding:15px">
       <div class="h2">فرع جديد</div>
@@ -727,10 +820,32 @@ function vSetupData() {
 
     <div class="h2" style="margin-top:22px">الورديات</div>
     <div class="list" style="margin-top:10px">
-      ${S.shifts.map(s => `<div class="line"><div style="flex:1">
-        <div style="font-weight:600;font-size:13px;color:#10294A">${esc(s.name)}</div>
-        <div class="mono" style="font-size:11px;color:#8A929C;margin-top:4px">${hhmm(s.startMinute)} — ${hhmm(s.endMinute)} · سماح ${s.graceMinutes || 0} د</div>
-      </div></div>`).join("") || `<div class="muted">مفيش ورديات.</div>`}
+      ${S.shifts.map(s => es === s.id ? `
+        <div class="card" style="padding:15px;border-color:#10294A">
+          <div class="h2">تعديل الوردية</div>
+          <div style="margin-top:11px"><label class="label">الاسم</label><input class="field" id="es_name" value="${esc(s.name)}"></div>
+          <div class="grid3" style="margin-top:10px">
+            <div><label class="label">البداية</label><input class="field mono" type="time" id="es_start" value="${hhmm(s.startMinute)}"></div>
+            <div><label class="label">النهاية</label><input class="field mono" type="time" id="es_end" value="${hhmm(s.endMinute)}"></div>
+            <div><label class="label">سماح (د)</label><input class="field mono" id="es_grace" inputmode="numeric" value="${s.graceMinutes || 0}"></div>
+          </div>
+          <div style="margin-top:12px">
+            <label class="label">الأوفر تايم يبدأ بعد نهاية الوردية بـ (دقيقة)</label>
+            <input class="field mono" id="es_ot" inputmode="numeric" value="${s.otAfterMinutes != null ? s.otAfterMinutes : 15}">
+          </div>
+          <div class="grid2" style="margin-top:12px">
+            <button class="btn ghost" style="padding:12px;font-size:12.5px" data-a="cancelEdit">إلغاء</button>
+            <button class="btn" style="padding:12px;font-size:12.5px" data-a="saveShift" data-v="${s.id}">حفظ</button>
+          </div>
+          <button class="btn danger" style="margin-top:9px;padding:12px;font-size:12.5px" data-a="delShift" data-v="${s.id}">حذف الوردية</button>
+        </div>` : `
+        <div class="line">
+          <div style="flex:1">
+            <div style="font-weight:600;font-size:13px;color:#10294A">${esc(s.name)}</div>
+            <div class="mono" style="font-size:11px;color:#8A929C;margin-top:4px">${hhmm(s.startMinute)} — ${hhmm(s.endMinute)} · سماح ${s.graceMinutes || 0} د · إضافي بعد ${s.otAfterMinutes != null ? s.otAfterMinutes : 15} د</div>
+          </div>
+          <button class="btn ghost" style="width:auto;padding:9px 13px;font-size:12px" data-a="editShift" data-v="${s.id}">تعديل</button>
+        </div>`).join("") || `<div class="muted">مفيش ورديات.</div>`}
     </div>
     <div class="card" style="margin-top:12px;padding:15px">
       <div class="h2">وردية جديدة</div>
@@ -739,6 +854,10 @@ function vSetupData() {
         <div><label class="label">البداية</label><input class="field mono" type="time" id="s_start" value="${esc(f.sStart || "09:00")}"></div>
         <div><label class="label">النهاية</label><input class="field mono" type="time" id="s_end" value="${esc(f.sEnd || "17:00")}"></div>
         <div><label class="label">سماح (د)</label><input class="field mono" id="s_grace" inputmode="numeric" value="${esc(f.sGrace || "5")}"></div>
+      </div>
+      <div style="margin-top:10px">
+        <label class="label">الأوفر تايم يبدأ بعد نهاية الوردية بـ (دقيقة)</label>
+        <input class="field mono" id="s_ot" inputmode="numeric" value="${esc(f.sOt || "15")}">
       </div>
       <button class="btn" style="margin-top:12px" data-a="addShift">إضافة الوردية</button>
     </div>
@@ -847,9 +966,15 @@ async function act(a, v, el) {
     }
     if (a === "prevMonth") { S.monthOffset--; await loadMonth(); return render(); }
     if (a === "nextMonth") { if (S.monthOffset >= 0) return; S.monthOffset++; await loadMonth(); return render(); }
-    if (a === "exportCsv") return exportCsv();
+    if (a === "exportCsv") { await loadTeamToday(); return exportCsv(); }
     if (a === "approve") return decide(S.pending.find(r => r.id === v), true);
     if (a === "reject") return decide(S.pending.find(r => r.id === v), false);
+    if (a === "override") {
+      const ok = el.getAttribute("data-ok") === "1";
+      if (!confirm(ok ? "تغيير القرار لموافقة؟" : "تغيير القرار لرفض؟")) return;
+      await decide(S.decided.find(r => r.id === v), ok);
+      return toast("تم تعديل القرار");
+    }
     if (a === "toggleActive") {
       const p = S.people.find(x => x.id === v);
       return saveEmployee(p, { active: !p.active });
@@ -858,6 +983,47 @@ async function act(a, v, el) {
       const p = S.people.find(x => x.id === v), patch = {};
       app.querySelectorAll(`[data-p="${v}"]`).forEach(f => { patch[f.getAttribute("data-k")] = f.value; });
       return saveEmployee(p, patch);
+    }
+    if (a === "editBranch") { S.form = { editBranch: v }; return render(); }
+    if (a === "editShift") { S.form = { editShift: v }; return render(); }
+    if (a === "cancelEdit") { S.form = {}; return render(); }
+    if (a === "reHere") {
+      const c = await getPos();
+      S.form.ebLat = c.latitude; S.form.ebLng = c.longitude;
+      return render();
+    }
+    if (a === "saveBranch") {
+      const b = S.branches.find(x => x.id === v);
+      const name = grab("eb_name").trim(), r = parseInt(grab("eb_radius") || "150", 10);
+      if (!name) return toast("الاسم مطلوب", true);
+      const lat = S.form.ebLat != null ? S.form.ebLat : b.lat;
+      const lng = S.form.ebLng != null ? S.form.ebLng : b.lng;
+      const latDelta = r / 111320, lngDelta = r / (111320 * Math.max(0.2, Math.cos(lat * Math.PI / 180)));
+      await updateDoc(doc(fb.db, "branches", v), {
+        name, lat, lng, radiusMeters: r,
+        latDelta: +latDelta.toFixed(7), lngDelta: +lngDelta.toFixed(7)
+      });
+      S.form = {}; await loadCommon(); toast("تم حفظ الفرع"); return render();
+    }
+    if (a === "delBranch") {
+      if (!confirm("تحذف الفرع؟ الموظفين المربوطين بيه مش هيقدروا يسجلوا لحد ما تحددلهم فرع تاني.")) return;
+      await deleteDoc(doc(fb.db, "branches", v));
+      S.form = {}; await loadCommon(); toast("تم الحذف"); return render();
+    }
+    if (a === "saveShift") {
+      const name = grab("es_name").trim(), st = grab("es_start"), en = grab("es_end");
+      const g = parseInt(grab("es_grace") || "0", 10), ot = parseInt(grab("es_ot") || "15", 10);
+      if (!name || !st || !en) return toast("املأ البيانات", true);
+      const toM = t => (+t.split(":")[0]) * 60 + (+t.split(":")[1]);
+      await updateDoc(doc(fb.db, "shifts", v), {
+        name, startMinute: toM(st), endMinute: toM(en), graceMinutes: g, otAfterMinutes: ot
+      });
+      S.form = {}; await loadCommon(); toast("تم حفظ الوردية"); return render();
+    }
+    if (a === "delShift") {
+      if (!confirm("تحذف الوردية؟")) return;
+      await deleteDoc(doc(fb.db, "shifts", v));
+      S.form = {}; await loadCommon(); toast("تم الحذف"); return render();
     }
     if (a === "useHere") {
       const c = await getPos();
@@ -876,11 +1042,13 @@ async function act(a, v, el) {
       S.form = {}; await loadCommon(); toast("تم إضافة الفرع"); return render();
     }
     if (a === "addShift") {
-      const name = grab("s_name").trim(), st = grab("s_start"), en = grab("s_end"), g = parseInt(grab("s_grace") || "5", 10);
+      const name = grab("s_name").trim(), st = grab("s_start"), en = grab("s_end");
+      const g = parseInt(grab("s_grace") || "5", 10), ot = parseInt(grab("s_ot") || "15", 10);
       if (!name || !st || !en) return toast("املأ البيانات", true);
       const toM = t => (+t.split(":")[0]) * 60 + (+t.split(":")[1]);
       await addDoc(collection(fb.db, "shifts"), {
-        name, startMinute: toM(st), endMinute: toM(en), graceMinutes: g, workdays: [0, 1, 2, 3, 4]
+        name, startMinute: toM(st), endMinute: toM(en), graceMinutes: g,
+        otAfterMinutes: ot, workdays: [0, 1, 2, 3, 4]
       });
       S.form = {}; await loadCommon(); toast("تم إضافة الوردية"); return render();
     }
