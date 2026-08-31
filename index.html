@@ -169,12 +169,20 @@ async function onUser(u) {
   S.user = u;
   if (!u) { S.me = null; S.screen = "auth"; return render(); }
   S.screen = "loading"; render();
+  const guard = setTimeout(() => {
+    if (S.screen === "loading") {
+      S.screen = "loadError";
+      S.loadErr = "الاتصال بقاعدة البيانات مش بيرد. أغلب الأحيان: قواعد الأمان مش منشورة، أو الشبكة بتحجب Firebase.";
+      render();
+    }
+  }, 12000);
+  try {
   const ref = doc(fb.db, "employees", u.uid);
   let snap = await getDoc(ref);
   if (!snap.exists()) {
     await setDoc(ref, {
       uid: u.uid, email: u.email, name: u.displayName || (u.email || "").split("@")[0],
-      employeeId: "", role: "employee", branchId: "", shiftId: "",
+      employeeId: "", role: "employee", branchId: "", shiftId: "", managerUid: "",
       active: false, createdAt: serverTimestamp()
     });
     snap = await getDoc(ref);
@@ -187,11 +195,16 @@ async function onUser(u) {
       S.me.active = true; S.me.role = "admin";
     } catch (e) { /* مش مدير نظام — عادي */ }
   }
-  if (!S.me.active) { S.screen = "pending"; return render(); }
+  if (!S.me.active) { clearTimeout(guard); S.screen = "pending"; return render(); }
   await loadCommon();
+  clearTimeout(guard);
   S.screen = isMgr() ? "mdash" : "home";
   render();
   watchToday();
+  } catch (e) {
+    clearTimeout(guard);
+    S.screen = "loadError"; S.loadErr = friendly(e); render();
+  }
 }
 async function loadCommon() {
   const [b, sh] = await Promise.all([getDocs(collection(fb.db, "branches")), getDocs(collection(fb.db, "shifts"))]);
@@ -225,23 +238,24 @@ async function loadRequests() {
   const mine = await getDocs(query(collection(fb.db, "requests"), where("uid", "==", S.user.uid)));
   S.requests = mine.docs.map(d => ({ id: d.id, ...d.data() }))
     .sort((a, b) => (toDate(b.createdAt) || 0) - (toDate(a.createdAt) || 0));
-  if (isMgr()) {
+  if (!isMgr()) return;
+  try {
     if (!S.people.length) {
       const emp = await getDocs(collection(fb.db, "employees"));
       S.people = emp.docs.map(d => ({ id: d.id, ...d.data() }));
     }
     S.myTeamIds = isAdmin() ? S.people.map(p => p.id) : subtreeIds(S.user.uid, S.people);
-    const p = await getDocs(query(collection(fb.db, "requests"), where("status", "==", "pending")));
-    S.pending = p.docs.map(d => ({ id: d.id, ...d.data() }))
-      .filter(r => r.uid !== S.user.uid && S.myTeamIds.indexOf(r.uid) !== -1);
-    // مدير النطام: قرارات المديرين الأخيرة — يقدر يعدلها
-    if (isAdmin()) {
-      const all = await getDocs(collection(fb.db, "requests"));
-      S.decided = all.docs.map(d => ({ id: d.id, ...d.data() }))
-        .filter(r => r.status !== "pending" && r.uid !== S.user.uid)
-        .sort((a, b) => (toDate(b.decidedAt) || 0) - (toDate(a.decidedAt) || 0))
-        .slice(0, 20);
-    }
+    const all = await getDocs(collection(fb.db, "requests"));
+    const list = all.docs.map(d => ({ id: d.id, ...d.data() }));
+    S.pending = list.filter(r => r.status === "pending" && r.uid !== S.user.uid
+      && S.myTeamIds.indexOf(r.uid) !== -1);
+    S.decided = isAdmin()
+      ? list.filter(r => r.status !== "pending" && r.uid !== S.user.uid)
+          .sort((a, b) => (toDate(b.decidedAt) || 0) - (toDate(a.decidedAt) || 0)).slice(0, 20)
+      : [];
+  } catch (e) {
+    S.pending = []; S.decided = [];
+    console.warn("manager data:", e);
   }
 }
 async function loadTeamToday() {
@@ -409,6 +423,15 @@ function view() {
   if (S.screen === "auth") return vAuth();
   if (S.screen === "loading" || S.screen === "boot") return `<div class="pad"><div class="muted">جاري التحميل…</div></div>`;
   if (S.screen === "pending") return vPending();
+  if (S.screen === "loadError") return `<div class="pad scroll">
+    <h1 class="h1">مش قادر أحمّل البيانات</h1>
+    <div class="card" style="margin-top:16px;padding:15px;background:#FBEDED;border-color:#EFD2D2">
+      <div style="font-size:13px;line-height:1.7;color:#8C1D1D">${esc(S.loadErr || "")}</div>
+    </div>
+    <p class="muted" style="margin-top:14px">لو الرسالة بتقول «الصلاحية مرفوضة»، يبقى قواعد الأمان محتاجة تتنشر تاني في Firebase ← Firestore ← Rules ← Publish.</p>
+    <button class="btn" style="margin-top:16px" data-a="reload">جرب تاني</button>
+    <button class="btn danger" style="margin-top:10px" data-a="logout">تسجيل الخروج</button>
+  </div>`;
   const body = {
     home: vHome, log: vLog, leave: vLeave, leaveNew: vLeaveNew, more: vMore,
     mdash: vMDash, mappr: vMAppr, mrep: vMRep, people: vPeople, setupData: vSetupData
@@ -754,8 +777,7 @@ function vPeople() {
       <div style="margin-top:10px"><label class="label">المدير المباشر — اللي هيوافق على طلباته</label>
         <select class="field" data-p="${p.id}" data-k="managerUid">
           <option value="">— مفيش مدير —</option>
-          ${S.people.filter(m => m.id !== p.id && m.role !== "employee")
-            .map(m => `<option value="${m.id}" ${p.managerUid === m.id ? "selected" : ""}>${esc(m.name)}${m.role === "admin" ? " (مدير عام)" : ""}</option>`).join("")}
+          ${S.people.filter(m => m.id !== p.id && m.role !== "employee")            .map(m => `<option value="${m.id}" ${p.managerUid === m.id ? "selected" : ""}>${esc(m.name)}${m.role === "admin" ? " (مدير عام)" : ""}</option>`).join("")}
         </select></div>
       <div class="grid2" style="margin-top:12px">
         <button class="btn ghost" style="padding:12px;font-size:12.5px" data-a="toggleActive" data-v="${p.id}">${p.active ? "إيقاف" : "تفعيل"}</button>
