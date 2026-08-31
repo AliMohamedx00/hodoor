@@ -393,7 +393,11 @@ async function exportCsv() {
   emp.docs.forEach(d => { shiftOf[d.id] = shById[d.data().shiftId] || null; });
   const fallback = { startMinute: 540, endMinute: 1020, graceMinutes: 5 };
   const rows = [["الموظف", "الرقم الوظيفي", "التاريخ", "اليوم", "الوردية", "الحضور", "الانصراف", "الساعات", "التأخير (دقيقة)", "إضافي (دقيقة)", "الطريقة", "الحالة"]];
-  // \u0627\u0644\u062a\u0642\u0631\u064a\u0631 \u0641\u0631\u064a\u0642 \u0627\u0644\u0645\u062f\u064a\u0631 \u0628\u0633 \u2014 \u0648\u0645\u062f\u064a\u0631 \u0627\u0644\u0646\u0637\u0627\u0645 \u064a\u0634\u0648\u0641 \u0627\u0644\u0643\u0644\n  const allowed = isAdmin() ? null : S.myTeamIds.concat([S.user.uid]);\n  r.docs.map(x => x.data())\n    .filter(a => !allowed || allowed.indexOf(a.uid) !== -1)\n    .sort((a, b) => a.date.localeCompare(b.date) || String(a.name).localeCompare(String(b.name))).forEach(a => {
+  // التقرير فريق المدير بس — ومدير النظام يشوف الكل
+  const allowed = isAdmin() ? null : S.myTeamIds.concat([S.user.uid]);
+  r.docs.map(x => x.data())
+    .filter(a => !allowed || allowed.indexOf(a.uid) !== -1)
+    .sort((a, b) => a.date.localeCompare(b.date) || String(a.name).localeCompare(String(b.name))).forEach(a => {
     const sh = shiftOf[a.uid] || fallback;
     const ci = toDate(a.checkInAt), co = toDate(a.checkOutAt);
     const inMin = ci ? ci.getHours() * 60 + ci.getMinutes() : 0;
